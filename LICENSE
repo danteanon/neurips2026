@@ -1,0 +1,36 @@
+Code in this reviewer package
+-----------------------------
+
+The novel contributions of this submission (`code/`, `benchmarking/`,
+`scripts/` directories) are released for reviewer use only during the
+NeurIPS 2026 review period. A permanent open-source licence
+(currently planned: Apache-2.0) will be applied to the public
+repository post-acceptance.
+
+Third-party code redistributed in this package
+----------------------------------------------
+
+* `code/model/dinov3/` — distilled from Meta AI's DINOv3 reference
+  implementation (Apache-2.0).
+* `code/model/dinov2.py`, `code/model/dinov2_layers/` — based on
+  Meta AI's DINOv2 (Apache-2.0).
+* `code/model/dpt_layers/` — based on Intel ISL MiDaS / DPT
+  (MIT licence).
+* `code/optim/muon.py` — based on Keller Jordan's Muon
+  reference (MIT licence).
+
+Benchmark competitors are NOT redistributed here. They are pulled
+on-demand by `scripts/clone_competitor_repos.sh`:
+
+* ResDepth (Stucker & Schindler, 2022)        — MIT
+* Open-Canopy (Fajwel et al., 2025)           — CC-BY-NC-4.0
+* Prompt Depth Anything (Yin et al., 2025)    — Apache-2.0
+* Depth Any Canopy (Rege Cambrin et al., 2024) — Apache-2.0
+* Meta CHMv2                                   — CC-BY-NC-4.0
+
+Dataset licences
+----------------
+
+See `DATA.md`. SynRS3D, OGC, and Meta CHMv2 are CC-BY-NC-4.0
+(research-only). DFC18/19 carry the IEEE GRSS contest terms.
+Open-Canopy is CC-BY-4.0.

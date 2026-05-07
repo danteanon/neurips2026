@@ -1,0 +1,297 @@
+# B9_v1_catt — replace VICReg with CHM-Aligned Token Training (CATT)
+#
+# Parent: B2_v1_vicreg_sreparam (val_mae 2.05, the best Plan v1 to date).
+# Reset point: this is *not* a B5 follow-up. B5/W8 keep VICReg with the
+# corrected calibration; B9 swaps the entire CHM-encoder regulariser to
+# the in-house CATT loss (`losses/catt_loss.py`). One variable changes
+# vs B2: the CHM-encoder regulariser. Everything else (σ-reparam stack,
+# data corruption, optimizer, scheduler, decoder LayerScale init) is
+# inherited unchanged.
+#
+# Why swap regulariser families:
+#   * VICReg's variance/covariance terms estimate per-channel statistics
+#     over the batch axis and structurally need B ≫ D. We are locked at
+#     B = 8, D = 1024 — the covariance matrix is rank-deficient (rank ≤ 7)
+#     and the variance hinge is dominated by sampling noise. The official
+#     code uses B = 2048; we cannot.
+#   * The empirical evidence (multi-batch encoder probe 2026-04-30,
+#     `docs/chm/insights/cross_run.md`) showed the failure modes that
+#     come from running VICReg at B = 8: W0/W1 input-blindness from the
+#     image-level granularity, B4 magnitude collapse from the calibration
+#     drift, and a degenerate small-magnitude attractor in B4 even after
+#     calibration was understood. B5 retests calibrated VICReg at B = 8
+#     as the control; B9 tests the alternative loss family.
+#
+# What CATT does (see `losses/catt_loss.py` for full design):
+#
+#   1. Per-token local CHM regression. A `Linear(D, k*k)` head on each
+#      token predicts the avg-pooled clean CHM in that token's 16 × 16
+#      receptive field. Supervised, batch-size-independent, naturally
+#      diversifies tokens — a constant or low-rank token bank cannot
+#      satisfy it. (`λ_local = 1.0`, `sub_patch_k = 1`).
+#   2. Directional cross-view consistency. `1 − cos(z1, z2)` per token
+#      between two corruptions of the same source. Cosine-only so the
+#      encoder cannot reduce it by shrinking outputs — that was B4's
+#      magnitude-collapse failure mode under VICReg's MSE invariance.
+#      (`λ_cons = 1.0`).
+#   3. Dense supervised CHM reconstruction. Uses the existing
+#      `CHMReconHead` machinery with `aux_chm_recon_target: clean` —
+#      the head is asked to reconstruct the *clean* CHM (= `gt` nDSM)
+#      from encoder tokens, not the corrupted input it was fed. This is
+#      the dense equivalent of (1) and gives every pixel of the encoder
+#      → reconstruction path graded supervision.
+#      (`aux_chm_recon_weight = 0.05`, 10× the B2 setting because the
+#      head is now part of the primary CHM-encoder objective rather than
+#      an autoencoding side-task).
+#
+# Hypotheses (in priority order):
+#   * Encoder magnitude / direction healthy: token-mean L2 norm ≥ 0.5
+#     throughout training (was ≈ 0.05 in B4 — the magnitude collapse).
+#     CATT cannot reduce loss by shrinking, so this should hold by
+#     construction.
+#   * Token-bank diversity: `cos_offdiag_mean` ≤ 0.5 (was 0.97 in U/W
+#     pre-fix). Per-token regression target is per-pixel-distinct so
+#     the encoder *must* differentiate tokens to fit.
+#   * `train_chm_catt_local` decreases monotonically (linear probe of
+#     the encoder reads CHM; if not, the encoder is not encoding CHM).
+#   * `train_chm_catt_consistency` reaches < 0.05 by ep 5 (paired views
+#     align in direction; cosine-only so consistent with arbitrary
+#     magnitude evolution).
+#   * `train_aux_chm_recon_loss` (now a denoising loss on clean CHM)
+#     decreases over training and tracks `train_chm_catt_local` —
+#     they are dense and sparse views of the same supervised signal.
+#   * Counterfactual MAE delta `|pred(chm) − pred(0)|` ≥ 0.5 m on
+#     held-out val by ep 5 (was 2.34 m on B2; CATT supervises the
+#     encoder so the cross-attention should still see useful tokens).
+#
+# Decision rule:
+#   * If best val_mae ≤ B2 (2.05 m) AND counterfactual delta ≥ 0.5 m:
+#     CATT replaces VICReg as the V1 default. Promote and proceed to
+#     Tier-2 sweeps (`sub_patch_k ∈ {2, 4}`, `lambda_local ∈ {0.5, 2}`,
+#     possibly removing the consistency term).
+#   * If best val_mae ≤ B2 but counterfactual delta < 0.5 m: encoder is
+#     informative but decoder still ignores it — orthogonal problem,
+#     keep CATT and revisit cross-attn / counterfactual hinge weight.
+#   * If best val_mae > B2: ablate within CATT (B9a = drop consistency,
+#     B9b = drop dense recon, B9c = drop per-token regression) to find
+#     which term contributes / hurts.
+
+name: "height-estimation-dpt-synrs3d-B9-v1-catt"
+mlflow_experiment: "tree-height"
+
+# --- Model ---
+model:
+  type: "dinov3_height_model"
+  name: "Dinov3HeightModelDPT"
+
+Dinov3HeightModelDPT:
+  num_classes: 1
+  backbone_type: "vitl"
+  dataset: "lvd1689m"
+  patch_size: 16
+  load_pretrained_backbone: true
+
+  n_layers: 10
+  n_heads: 8
+  ffn_ratio: 4
+  dropout: 0.1
+  chm_dropout: 0.0
+  aux_chm_recon: true
+  cross_attn_window: 3
+
+  # Same LayerScale stack as B5: cross-attn gets 10⁴× higher init so
+  # the CHM residual carries weight from step 0. CATT's per-token
+  # regression supervises the encoder, but the decoder still needs
+  # the cross-attn residual ungated to actually use the encoder's
+  # output.
+  layer_scale_init: 1.0e-5
+  cross_attn_layer_scale_init: 1.0e-1
+
+  # Per-layer CHM-prediction probe is kept — it is independent of CATT
+  # (operates on decoder cross-attn outputs, not encoder tokens) and
+  # was a key part of the B4/B5 stack that pulls cross-attention into
+  # actually using CHM.
+  chm_pred_per_layer: true
+
+  decoder_cross_attn_qkv_spectral_norm: true
+  decoder_self_attn_qkv_spectral_norm: true
+  sigma_reparam_learnable: true
+  sigma_reparam_apply_to_all_linears: true
+  sigma_reparam_gamma_init: "svd"
+
+  dpt_features: 256
+  dpt_out_channels: [256, 512, 1024, 1024]
+  dpt_use_bn: false
+  reinit_dpt_head: true
+
+# --- Lightning module ---
+lightning_module:
+  class_name: "HeightEstimationModule"
+
+task_type: "regression"
+classes: 1
+channels: 3
+
+# --- Losses ---
+loss: ["L1HeightLoss", "GradientMatchingLoss"]
+loss_weights: [1.0, 0.1]
+L1HeightLoss:
+  ignore_zero: false
+GradientMatchingLoss:
+  ignore_zero: false
+
+# --- aux_chm_recon (dense CATT term) ---
+# Target switches from "input" (corrupted CHM, autoencoder) to "clean"
+# (gt nDSM, denoising). Weight bumped 10× from B2's 0.005 because the
+# head is now part of the primary CHM-encoder objective rather than an
+# autoencoding side-task.
+aux_chm_recon_weight: 0.05
+aux_chm_recon_target: "clean"
+
+# --- CATT (replaces VICReg) ---
+chm_catt:
+  enabled: true
+  patch_size: 16        # matches model.patch_size
+  sub_patch_k: 1        # k=1 → predict mean CHM per token
+  lambda_local: 1.0     # weight on per-token regression
+  lambda_consistency: 1.0  # weight on directional consistency
+
+# --- VICReg DISABLED for B9 ---
+# Block kept commented for diff visibility against B5; CATT and VICReg
+# can technically coexist but B9 is the pure-CATT control.
+# chm_vicreg:
+#   enabled: false
+
+# --- Per-layer CHM probe (option E) ---
+chm_per_layer_probe:
+  enabled: true
+  weight: 0.01
+
+# --- Counterfactual usage hinge (option C) ---
+chm_counterfactual:
+  enabled: true
+  margin: 0.5
+  weight: 1.0
+  every_k_steps: 1
+
+# --- Health probes ---
+chm_health_probes:
+  enabled: true
+  log_grad_every_n_steps: 100
+  log_attn_every_n_steps: 200
+  input_sens_every_n_epochs: 1
+  attn_max_layers: 3
+  input_sens_image_size: 256
+
+# --- Data ---
+train_data_loader:
+  class: "SynRS3DHeightDataset"
+  data_dir: "data/tg/tree_height/synrs3d/SynRS3D"
+  subsets:
+    - "grid_g005_high_v1"
+    - "grid_g005_mid_v1"
+    - "grid_g005_low_v1"
+    - "grid_g05_high_v1"
+    - "grid_g05_mid_v1"
+    - "grid_g05_low_v1"
+    - "terrain_g005_high_v1"
+    - "terrain_g005_low_v1"
+    - "terrain_g05_high_v1"
+    - "terrain_g05_low_v1"
+    - "terrain_g1_high_v1"
+    - "terrain_g1_low_v1"
+  normalisation: "8bit"
+  channels: 3
+  chm_corruption:
+    cutout_prob: 0.5
+    cutout_area_range: [0.10, 0.30]
+    cutout_one_large_prob: 0.5
+    cutout_n_scattered: [3, 8]
+    cutout_aspect_ratio: [0.3, 3.3]
+    max_shift: 24
+    resolution_factor: 0.25
+    height_noise_sigma: 1.5
+    full_dropout_prob: 0.0
+    always_on_noise_sigma: 0.05
+  # CATT consumes the contrastive-corruption views identically to VICReg.
+  # Same hyper-parameters as B5 so the encoder sees the same augmentation
+  # distribution and regulariser-comparison is apples-to-apples.
+  chm_contrastive_corruption:
+    height_scale_range: [0.85, 1.15]
+    gaussian_blur_sigma_range: [0.0, 1.5]
+    resolution_factor_range: [0.5, 1.0]
+    height_noise_sigma_range: [0.5, 2.0]
+    salt_pepper_prob: 0.0
+    salt_pepper_amount: 0.05
+  transforms:
+    augmentations: ["crop", "spatial", "color"]
+    scaling: "imagenet_scaling"
+    image_size: 256
+
+val_data_loader:
+  class: "SynRS3DHeightDataset"
+  data_dir: "data/tg/tree_height/synrs3d/SynRS3D"
+  subsets:
+    - "grid_g005_mid_v2"
+    - "grid_g05_mid_v2"
+    - "terrain_g005_mid_v1"
+  normalisation: "8bit"
+  channels: 3
+  chm_corruption:
+    cutout_prob: 0.5
+    cutout_area_range: [0.10, 0.30]
+    cutout_one_large_prob: 0.5
+    cutout_n_scattered: [3, 8]
+    cutout_aspect_ratio: [0.3, 3.3]
+    max_shift: 24
+    resolution_factor: 0.25
+    height_noise_sigma: 1.5
+    full_dropout_prob: 0.0
+    always_on_noise_sigma: 0.05
+  transforms:
+    augmentations: ["crop"]
+    scaling: "imagenet_scaling"
+    image_size: 512
+
+dataloader:
+  batch_size: 8
+  val_batch_size: 8
+  num_workers: 4
+  pin_memory: true
+
+optimizer: "Muon"
+optimizer_params:
+  lr: 0.02
+  momentum: 0.95
+  ns_steps: 5
+  adamw_lr: 1.0e-4
+  adamw_weight_decay: 0.01
+
+scheduler:
+  name: "CosineAnnealingLRWithWarmup"
+  params:
+    CosineAnnealingLRWithWarmup:
+      warmup_iters: 7135
+      total_iters: 21405
+      eta_min: 1.0e-7
+
+early_stopping: true
+early_stop:
+  monitor: "val_mae"
+  mode: "min"
+  min_delta: 0.05
+  patience: 10
+  verbose: 1
+
+trainer:
+  max_epochs: 50
+  precision: "bf16-mixed"
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 4
+  devices: [0]
+
+checkpoint_dir: "checkpoints"
+log_dir: "logs"
+
+mlflow_image_logging: true
+mlflow_image_log_freq: 1

@@ -1,0 +1,64 @@
+# ============================================================
+# Reviewer-package dependencies
+#
+# Pinned to the same versions used during the original training and
+# benchmark runs. PyTorch, torchvision, torchaudio are NOT listed
+# here:
+#   - On a CUDA host: install the matching torch wheel for your CUDA
+#     toolkit, e.g.
+#         pip install torch==2.11.0 torchvision==0.21.0 \
+#             --index-url https://download.pytorch.org/whl/cu128
+#   - On a CPU host (eval only, no training): plain
+#         pip install torch==2.11.0 torchvision==0.21.0
+#
+# torch >= 2.11 is required for `torch.optim.Muon`, used by the B9
+# config (see code/optim/muon.py).
+# ============================================================
+
+# --- PyTorch Lightning ecosystem ---
+lightning==2.6.1
+torchmetrics==1.9.0
+tensorboard==2.20.0
+
+# --- Vision / augmentation ---
+albumentations==2.0.8
+opencv-python-headless==4.13.0.92
+kornia==0.8.2
+segmentation_models_pytorch==0.5.0
+timm==1.0.26
+einops==0.8.2
+
+# --- Numeric / scientific ---
+numpy==2.4.0
+scipy==1.17.1
+scikit-image==0.26.0
+pandas==2.3.3
+pillow==12.2.0
+
+# --- Geospatial (required for GeoTIFF I/O in inference + DFC loaders) ---
+rasterio==1.5.0
+shapely==2.1.2
+pyproj==3.7.2
+
+# --- Data formats / storage ---
+pyarrow==17.0.0
+PyYAML==6.0.3
+h5py==3.16.0
+
+# --- HuggingFace (backbone weight loading + Open-Canopy / DAC / CHMv2) ---
+safetensors==0.7.0
+huggingface-hub==0.34.4
+transformers==4.56.1
+
+# --- Reviewer-package extras (NOT in the main repo's requirements.txt) ---
+# Speeds up large HF downloads for the SynRS3D + Open-Canopy datasets.
+hf_transfer==0.1.10
+# `gdown` is the standard helper for Google-Drive-hosted datasets;
+# DFC18/DFC19/OGC/GeoNRW are all distributed via gdown links by the
+# upstream SynRS3D authors.
+gdown==5.2.0
+# Used by scripts/clone_competitor_repos.sh helpers and by
+# corruption_sweep.py for retry/backoff on flaky CDN downloads.
+requests==2.32.5
+tqdm==4.67.3
+matplotlib==3.10.9

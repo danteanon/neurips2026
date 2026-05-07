@@ -1,0 +1,376 @@
+# P1_v1_catt_synoc_dfcval — first production-line CHM run.
+#
+# This is the start of the **P-series** (production-line). P-runs are
+# distinct from B/W ablations:
+#   * Ablations isolate one mechanism on synthetic data and judge by
+#     synthetic val_mae. The control of variables matters more than the
+#     deployability of the resulting model.
+#   * Production runs combine the best mechanisms identified by
+#     ablations, train on real-world data wherever possible, and judge
+#     on **held-out real-world** val_mae. The deployability of the
+#     resulting model is the only success criterion that matters.
+#
+# Parent: B9_v1_catt (CATT V1 — currently the best lever family for
+# rank/diversity on the encoder).
+#
+# What this run changes vs B9:
+#
+#   * Train data: PerSourceBatchDataset over two streams.
+#       - Stream A: SynRS3D synthetic (12 v1 subsets, 45,678 samples)
+#         with the full B9 chm_corruption stack — synthetic
+#         (image, stale-CHM, gt-height) triplets.
+#       - Stream B: Open-Canopy real-stale (image=2023, prompt=2021;
+#         57,003 windows after year_pair filter). The prompt is the
+#         actual 2021 LiDAR-HD CHM, the target is the 2023 LiDAR-HD
+#         CHM, and the image is the 2023 SPOT pansharpened tile —
+#         a 2-year staleness gap with real ecological change
+#         (clearcut, regrowth, sensor reprocessing).
+#       Per-source stratified batching guarantees every gradient step
+#       sees both distributions, which matters because:
+#         (a) the synthetic stream dominates by sample count in any
+#             shuffle-based mix, even though Open-Canopy has more
+#             windows total — we sub-sample OC to 57k for the cleanest
+#             staleness signal;
+#         (b) BatchNorm statistics in the encoder/DPT decoder need to
+#             see the SPOT distribution every step or they drift;
+#         (c) CATT's per-token regression needs the dense supervision
+#             to be representative of *both* domains in every step.
+#
+#   * Val data: PerSourceBatchDataset over two streams.
+#       - Stream A: SynRS3D held-out — same v2 subsets that B9 used
+#         (grid_g005_mid_v2, grid_g05_mid_v2, terrain_g005_mid_v1;
+#         22,203 samples). These are different from the v1 subsets
+#         used in train, so it's a proper held-out synthetic split,
+#         and it lets us compare apples-to-apples against every prior
+#         B/W ablation's `val_mae` (they all measured on this same
+#         synthetic split).
+#       - Stream B: DFC18 + DFC19 (11,191 real samples). DFC was
+#         never used in any prior B/W training, so this is genuinely
+#         held-out real-world. This is the metric that decides
+#         whether the model ships.
+#     The default PerSourceBatch length = max(stream sizes) = 22,203,
+#     so DFC samples wrap modulo (~2× per epoch) and SynRS3D val
+#     samples are seen exactly once. Both well-represented in the
+#     aggregate `val_mae` (which is averaged over batches).
+#
+#   * LR schedule: total_iters recomputed correctly. Plain B9 had
+#     total_iters=21405 vs max_epochs=50 → LR floored at ep ~15
+#     (the bug we caught on B5). P1 budgets total_iters for the
+#     actual planned step count.
+#
+#   * Batch composition: DataLoader batch_size=8 with 2 sources →
+#     micro-batch=16 actual samples (8 SynRS3D + 8 Open-Canopy).
+#     accumulate_grad_batches=2 → effective optimizer batch = 32.
+#     Same effective batch as the working B6/B10 sizing on 48GB
+#     A6000. Should fit comfortably with V1 + chm_counterfactual
+#     (which doubles decoder passes).
+#
+#   * Logical epoch length = 22,000 rounds → ~½ SynRS3D pass per
+#     epoch + Open-Canopy wraps modulo (22000/57003 = 38.6% per
+#     epoch, full coverage every ~2.6 epochs).
+#
+# What this run keeps verbatim from B9:
+#
+#   * Architecture: Dinov3HeightModelDPT (V1), σ-reparam stack on all
+#     linears, decoder LayerScale init (cross-attn 1e-1, self-attn
+#     1e-5), per-layer CHM probe (weight 0.01), counterfactual hinge
+#     (margin 0.5, weight 1.0).
+#   * CATT objective: per-token local CHM regression (sub_patch_k=1,
+#     λ_local=1.0), directional cross-view consistency (λ_cons=1.0),
+#     dense aux_chm_recon to clean target (weight 0.05).
+#   * Optimizer: Muon (lr 0.02, AdamW lr 1e-4 for non-Muon params).
+#   * Health probes enabled.
+#
+# Hypotheses (in priority order):
+#
+#   * Held-out real DFC val_mae beats the synthetic-trained baseline.
+#     B9 itself measured val_mae on synthetic — for an apples-to-real
+#     comparison, also runs the prior best B-series checkpoint on
+#     DFC val (separate eval; not part of this run).
+#   * Encoder magnitude/diversity diagnostics from B9 hold up under
+#     the mixed (synth+real) input distribution: token L2 ≥ 0.5,
+#     cos_offdiag_mean ≤ 0.5.
+#   * train_chm_catt_local decreases monotonically across both
+#     sources — i.e. the per-token regression head learns CHM from
+#     real-stale prompts as well as synthetic ones.
+#   * No catastrophic distribution collapse: train loss curves on
+#     SynRS3D-only (run separately for diff) and SynRS3D+OC should
+#     both be monotonically decreasing.
+
+name: "height-estimation-dpt-synoc-P1-v1-catt"
+# Same MLflow experiment as ablations so all runs (B/W/P) live side-by-side
+# in one place. The run-name prefix (`P1_*`) + tags carry the production
+# distinction — no need for a parallel experiment.
+mlflow_experiment: "tree-height"
+
+# --- Model (B9 verbatim) ---
+model:
+  type: "dinov3_height_model"
+  name: "Dinov3HeightModelDPT"
+
+Dinov3HeightModelDPT:
+  num_classes: 1
+  backbone_type: "vitl"
+  dataset: "lvd1689m"
+  patch_size: 16
+  load_pretrained_backbone: true
+
+  n_layers: 10
+  n_heads: 8
+  ffn_ratio: 4
+  dropout: 0.1
+  chm_dropout: 0.0
+  aux_chm_recon: true
+  cross_attn_window: 3
+
+  layer_scale_init: 1.0e-5
+  cross_attn_layer_scale_init: 1.0e-1
+  chm_pred_per_layer: true
+
+  decoder_cross_attn_qkv_spectral_norm: true
+  decoder_self_attn_qkv_spectral_norm: true
+  sigma_reparam_learnable: true
+  sigma_reparam_apply_to_all_linears: true
+  sigma_reparam_gamma_init: "svd"
+
+  dpt_features: 256
+  dpt_out_channels: [256, 512, 1024, 1024]
+  dpt_use_bn: false
+  reinit_dpt_head: true
+
+# --- Lightning module ---
+lightning_module:
+  class_name: "HeightEstimationModule"
+
+task_type: "regression"
+classes: 1
+channels: 3
+
+# --- Losses (B9 verbatim) ---
+loss: ["L1HeightLoss", "GradientMatchingLoss"]
+loss_weights: [1.0, 0.1]
+L1HeightLoss:
+  ignore_zero: false
+GradientMatchingLoss:
+  ignore_zero: false
+
+aux_chm_recon_weight: 0.05
+aux_chm_recon_target: "clean"
+
+chm_catt:
+  enabled: true
+  patch_size: 16
+  sub_patch_k: 1
+  lambda_local: 1.0
+  lambda_consistency: 1.0
+
+chm_per_layer_probe:
+  enabled: true
+  weight: 0.01
+
+chm_counterfactual:
+  enabled: true
+  margin: 0.5
+  weight: 1.0
+  every_k_steps: 1
+
+chm_health_probes:
+  enabled: true
+  log_grad_every_n_steps: 100
+  log_attn_every_n_steps: 200
+  input_sens_every_n_epochs: 1
+  attn_max_layers: 3
+  input_sens_image_size: 256
+
+# --- Train data: per-source stratified mix ---
+# DataLoader.batch_size=8 → 8 rounds, each round = 1 sample per source
+# → micro-batch of 16 actual samples (8 SynRS3D + 8 Open-Canopy).
+# Custom per_source_collate flattens the per-round lists in source
+# order so the resulting tensor's leading dim is interpretable.
+train_data_loader:
+  class: "PerSourceBatchDataset"
+  data_dir: ""
+  length: 22000
+  streams:
+    - class: "SynRS3DHeightDataset"
+      data_dir: "data/tg/tree_height/synrs3d/SynRS3D"
+      name: "synrs3d_v1"
+      subsets:
+        - "grid_g005_high_v1"
+        - "grid_g005_mid_v1"
+        - "grid_g005_low_v1"
+        - "grid_g05_high_v1"
+        - "grid_g05_mid_v1"
+        - "grid_g05_low_v1"
+        - "terrain_g005_high_v1"
+        - "terrain_g005_low_v1"
+        - "terrain_g05_high_v1"
+        - "terrain_g05_low_v1"
+        - "terrain_g1_high_v1"
+        - "terrain_g1_low_v1"
+      normalisation: "8bit"
+      channels: 3
+      chm_corruption:
+        cutout_prob: 0.5
+        cutout_area_range: [0.10, 0.30]
+        cutout_one_large_prob: 0.5
+        cutout_n_scattered: [3, 8]
+        cutout_aspect_ratio: [0.3, 3.3]
+        max_shift: 24
+        resolution_factor: 0.25
+        height_noise_sigma: 1.5
+        full_dropout_prob: 0.0
+        always_on_noise_sigma: 0.05
+      chm_contrastive_corruption:
+        height_scale_range: [0.85, 1.15]
+        gaussian_blur_sigma_range: [0.0, 1.5]
+        resolution_factor_range: [0.5, 1.0]
+        height_noise_sigma_range: [0.5, 2.0]
+        salt_pepper_prob: 0.0
+        salt_pepper_amount: 0.05
+      transforms:
+        augmentations: ["crop", "spatial", "color"]
+        scaling: "imagenet_scaling"
+        image_size: 256
+
+    - class: "OpenCanopyStalePairDataset"
+      data_dir: "data/tg/tree_height/synrs3d/open_canopy"
+      name: "open_canopy_2023_2021"
+      manifest_path: "data/tg/tree_height/synrs3d/open_canopy/manifests/train_w256_s256.jsonl"
+      year_pairs: [[2023, 2021]]   # cleanest 2-year staleness gap (57,003 windows)
+      normalisation: "8bit"
+      channels: 3
+      # No chm_corruption — the prompt is real stale LiDAR.
+      chm_contrastive_corruption:
+        height_scale_range: [0.85, 1.15]
+        gaussian_blur_sigma_range: [0.0, 1.5]
+        resolution_factor_range: [0.5, 1.0]
+        height_noise_sigma_range: [0.5, 2.0]
+        salt_pepper_prob: 0.0
+        salt_pepper_amount: 0.05
+      transforms:
+        augmentations: ["crop", "spatial", "color"]
+        scaling: "imagenet_scaling"
+        image_size: 256
+
+# --- Val data: SynRS3D held-out + DFC real-world held-out ---
+# Two-stream PerSourceBatchDataset — same machinery as train, so the
+# global `dataloader.collate_fn = per_source_collate` works for both
+# loaders (data_module._get_collate_fn doesn't support per-loader
+# overrides). Both streams have contrastive corruption OFF, so each
+# returns a 3-tuple and PerSourceBatch's tuple-arity invariant holds;
+# the model's validation_step tolerates both 3- and 5-tuples.
+#
+# Stream order (synrs3d first, real second) matches train so that the
+# per_source_collate flatten produces a consistent leading-dim layout
+# across epochs: [synrs3d_0, dfc_0, synrs3d_1, dfc_1, ...].
+val_data_loader:
+  class: "PerSourceBatchDataset"
+  data_dir: ""
+  streams:
+    # Stream A — synthetic held-out, same v2 subsets as every B/W ablation's
+    # val. Lets us compare P1's val_mae against all prior runs apples-to-
+    # apples, and gives an early-warning for synthetic regression while
+    # we layer in the real-world stream.
+    - class: "SynRS3DHeightDataset"
+      data_dir: "data/tg/tree_height/synrs3d/SynRS3D"
+      name: "synrs3d_v2_holdout"
+      subsets:
+        - "grid_g005_mid_v2"
+        - "grid_g05_mid_v2"
+        - "terrain_g005_mid_v1"
+      normalisation: "8bit"
+      channels: 3
+      chm_corruption:
+        cutout_prob: 0.5
+        cutout_area_range: [0.10, 0.30]
+        cutout_one_large_prob: 0.5
+        cutout_n_scattered: [3, 8]
+        cutout_aspect_ratio: [0.3, 3.3]
+        max_shift: 24
+        resolution_factor: 0.25
+        height_noise_sigma: 1.5
+        full_dropout_prob: 0.0
+        always_on_noise_sigma: 0.05
+      transforms:
+        augmentations: ["crop"]
+        scaling: "imagenet_scaling"
+        image_size: 512
+
+    # Stream B — DFC real-world held-out. Treated as the production-
+    # readiness metric. DFC's GT nDSM is the clean substrate; we still
+    # synthesise a slightly-degraded prompt to match what production
+    # sees at inference (the prompt is never perfectly aligned with
+    # the image).
+    - class: "SynRS3DHeightDataset"
+      data_dir: "data/tg/tree_height/synrs3d/dfc"
+      name: "dfc_val"
+      subsets: ["DFC18", "DFC19"]
+      normalisation: "8bit"
+      channels: 3
+      chm_corruption:
+        cutout_prob: 0.5
+        cutout_area_range: [0.10, 0.30]
+        cutout_one_large_prob: 0.5
+        cutout_n_scattered: [3, 8]
+        cutout_aspect_ratio: [0.3, 3.3]
+        max_shift: 24
+        resolution_factor: 0.25
+        height_noise_sigma: 1.5
+        full_dropout_prob: 0.0
+        always_on_noise_sigma: 0.05
+      transforms:
+        augmentations: ["crop"]
+        scaling: "imagenet_scaling"
+        image_size: 512
+
+dataloader:
+  batch_size: 8                       # train micro-batch = 8×2 sources = 16
+  val_batch_size: 4                   # val micro-batch = 4×2 sources = 8 (matches B9 val mem)
+  num_workers: 4
+  pin_memory: true
+  collate_fn: "per_source_collate"
+
+# --- Optimizer (B9 verbatim) ---
+optimizer: "Muon"
+optimizer_params:
+  lr: 0.02
+  momentum: 0.95
+  ns_steps: 5
+  adamw_lr: 1.0e-4
+  adamw_weight_decay: 0.01
+
+# --- Schedule (recomputed for actual step budget) ---
+# Scheduler interval=step → ticked every micro-batch.
+# micro_batches/epoch = ceil(length / DataLoader.batch_size)
+#                     = ceil(22000 / 8) = 2750
+# total_iters = 2750 * max_epochs(30) = 82,500
+# warmup_iters ≈ 10% of total = 8,250
+scheduler:
+  name: "CosineAnnealingLRWithWarmup"
+  params:
+    CosineAnnealingLRWithWarmup:
+      warmup_iters: 8250
+      total_iters: 82500
+      eta_min: 1.0e-7
+
+early_stopping: true
+early_stop:
+  monitor: "val_mae"
+  mode: "min"
+  min_delta: 0.05
+  patience: 10
+  verbose: 1
+
+trainer:
+  max_epochs: 30
+  precision: "bf16-mixed"
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 2          # effective batch = micro_batch(16) * 2 = 32
+  devices: [0]
+
+checkpoint_dir: "checkpoints"
+log_dir: "logs"
+
+mlflow_image_logging: true
+mlflow_image_log_freq: 1

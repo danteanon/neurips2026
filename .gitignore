@@ -1,0 +1,29 @@
+# Reviewer-package runtime artefacts (kept out of the submitted bundle)
+__pycache__/
+*.pyc
+*.pyo
+
+# Downloaded weights, data, and cloned competitor repos.
+weights/*.ckpt
+weights/*.pth
+weights/*.safetensors
+data/
+benchmarking/repos/*
+!benchmarking/repos/.gitkeep
+benchmarking/results/
+benchmarking/results_*/
+benchmarking/figures/
+
+# DINOv3 backbone cache (created on first model load)
+model_weights/
+
+# Inference outputs
+*.tif
+*.tiff
+*.npy
+!benchmarking/configs/*.yaml
+
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
