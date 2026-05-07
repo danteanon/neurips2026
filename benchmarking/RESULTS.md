@@ -179,28 +179,94 @@ achieves a healthy 2.38 m all-pixel MAE.
 
 ---
 
-## 9. Coverage matrix — what has been run
+## 9. Indoor metric depth — Hp7 vs PromptDA on ARKitScenes Validation
+
+A separate experiment that probes the same prompt-trust hypothesis on
+a *fully different* modality (Apple iPhone-LiDAR → highres LiDAR) where
+PromptDA itself is the published state of the art. We compare:
+
+* **Hp7** — DINOv2-ViT-L (frozen, initialised from Depth-Anything-V2)
+  + DA-V2 DPT head + the same 10-layer cross-attention CHM decoder
+  used by CATT. Trained on **HyperSim only** with shift+blur+noise
+  prompt corruption. See `code/configs/Hp7_v1_hypersim_dav2.yaml`.
+* **PromptDA-ViTL** (`depth-anything/prompt-depth-anything-vitl`) —
+  the published baseline, used as-is.
+
+For every frame both models receive the *same* RGB tile and the *same*
+metric depth prompt. The prompt is then progressively corrupted; for
+each (frame_id, regime) numpy/random RNG state is seeded with
+`hash((frame_id, regime))` so cutout placements and shift directions
+are identical across model passes (paired deltas).
+
+Configuration: 2 000 round-robin-sampled frames across all 287
+Validation videos, 5 regimes, 2 models = 20 000 forward passes total
+(~35 min on a single A6000). Tile size 448 × 448, depth clipped to
+10 m, MAE computed over `gt > 0` pixels per frame.
+
+| Regime | Hp7 mean | Hp7 med | Hp7 Δclean | PromptDA mean | PromptDA med | PromptDA Δclean |
+|---|---:|---:|---:|---:|---:|---:|
+| `clean`        | 0.074 | 0.066 | +0.000 | **0.017** | 0.017 | +0.000 |
+| `shift_24`     | 0.081 | 0.073 | +0.007 | 0.053 | 0.044 | +0.035 |
+| `shift_48`     | **0.093** | 0.084 | +0.020 | 0.100 | 0.083 | +0.082 |
+| `cutout_25pct` | **0.105** | 0.095 | +0.031 | 0.452 | 0.435 | +0.435 |
+| `cutout_50pct` | **0.169** | 0.148 | +0.095 | 0.775 | 0.751 | +0.758 |
+
+All MAE values in metres. Bold numbers are the better model in that
+row.
+
+### Key takeaways
+
+1. **Clean: PromptDA wins** (1.7 cm vs 7.4 cm). Expected — PromptDA
+   was trained on this exact domain (ARKit-style synthetic LiDAR).
+   Hp7 was trained on HyperSim only and is being evaluated zero-shot.
+2. **Shift_48 already flips the ordering.** Hp7 (+2.0 cm) is more
+   robust than PromptDA (+8.2 cm) once the prompt is misaligned by
+   ~10 % of the tile.
+3. **Cutout collapse.** With 25 % of the prompt zeroed out PromptDA's
+   MAE jumps from 1.7 cm to 45.2 cm — a **27×** degradation. Hp7's
+   MAE goes from 7.4 cm to 10.5 cm (1.4×). At 50 % cutout PromptDA
+   sits at 77.5 cm while Hp7 stays at 16.9 cm.
+4. **Robustness explanation.** The cross-attention decoder used by
+   Hp7 was trained with a CHM-corruption schedule (shift, blur,
+   always-on noise). PromptDA's trust in the prompt is implicit in
+   its architecture: when the prompt is contiguously missing, no
+   pathway in the model down-weights it. This is exactly the
+   "prompt-trust collapse" failure mode the CATT loss was designed
+   to mitigate in the aerial setting.
+
+Reproducer: `bash benchmarking/run_hp7_arkit_benchmark.sh`. Output
+files are bundled at `benchmarking/results/arkitscenes/`:
+
+* `results_hp7_vs_promptda_arkit_summary.md` — table above.
+* `results_hp7_vs_promptda_arkit_summary.json` — same metrics + p95.
+* `results_hp7_vs_promptda_arkit_full.json` — every per-(frame,
+  regime, model) row (~3.7 MB, 30 000 entries).
+
+---
+
+## 10. Coverage matrix — what has been run
 
 Legend: ✓ done · ⏳ in progress · ⏸ queued · ✗ skipped/blocked
-| Model ↓  Dataset → | DFC val (11,217) | Track2-RGB (1,816) | Open-Canopy native | DFC val tree-mask | OC tree-mask (10k) | ARKitScenes |
+| Model ↓  Dataset → | DFC val (11,217) | Track2-RGB (1,816) | Open-Canopy native | DFC val tree-mask | OC tree-mask (10k) | ARKitScenes Val (2,000) |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Ours (CATT)** | ✓ (full sweep + tree mask) | ✓ (full sweep) | ✓ (clean + zero_chm, 10k) | ✓ | ✓ | ⏸ training pending (P4) |
+| **Ours (CATT, P1)** | ✓ (full sweep + tree mask) | ✓ (full sweep) | ✓ (clean + zero_chm, 10k) | ✓ | ✓ | n/a (different modality) |
+| **Ours (Hp7)** | n/a (different modality) | n/a | n/a | n/a | n/a | ✓ (5-regime paired sweep) |
 | ResDepth | ✓ (legacy 500) | ✓ (full sweep) | n/a | n/a | n/a | n/a |
 | Meta CHMv2 | ✓ (clean + tree mask) | ✓ (clean) | ✓ (10k clean) | ✓ | ✓ | n/a |
 | Open-Canopy PVTv2 | ✓ (clean + 2 ablations) | ✓ (clean) | ✓ (40k clean) | n/a (no mask reads) | n/a | n/a |
-| PromptDA | — | — | — | — | — | ⏸ blocked on CATT training |
+| PromptDA | n/a (different modality) | n/a | n/a | n/a | n/a | ✓ (paired with Hp7) |
 
-Total benchmark runs completed: **84 result JSONs** under
-`results_chmv2/`, `results_opencanopy/`, `results_track2_msi/`,
-`results_track2_rgb/`, `results_treemask/`.
+Total benchmark runs completed: **84 result JSONs** for the aerial
+sweep + the 30 000-row Hp7 vs PromptDA paired matrix.
 
 All four `treemask` sweep jobs finished at **2026-05-05 17:29 IST**.
+The Hp7 vs PromptDA full ARKitScenes sweep finished at **2026-05-07
+14:19 IST**.
 
 ---
 
 ## Pending
 
-- **PromptDA / ARKitScenes** — needs CATT-on-ARKit training first
-  (in `P4_arkitscenes` session).
 - **RESULTS.md figures** (line charts: MAE vs shift; bar chart: tree
-  vs ground per model) — not yet generated.
+  vs ground per model; cutout-sweep curves for Hp7/PromptDA) — not
+  yet generated.

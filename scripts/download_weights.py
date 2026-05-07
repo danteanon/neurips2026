@@ -1,29 +1,48 @@
 #!/usr/bin/env python
-"""Download the published P1 (CATT) checkpoint from the Hugging Face Hub.
+"""Download published model checkpoints from the Hugging Face Hub.
 
-The reference checkpoint for the paper is
-``P1_v1_catt_synoc_dfcval`` (epoch 17, val MAE = 1.9166 m). It is
-hosted in the public ``mldatauser/model_weights`` repo under
-``height_estimation/P1_v1_catt_synoc_dfcval/``.
+Two model families are bundled with this submission and hosted under
+``mldatauser/model_weights/height_estimation/``:
 
-The same repo also hosts:
-  * ``last.ckpt``                              (final epoch)
-  * ``epoch=15-val_mae=1.9824.ckpt``           (alt early-stop)
-  * ``epoch=18-val_mae=1.9715.ckpt``           (alt late-stop)
-  * ``config.yaml``                            (training config)
-  * ``README.md``                              (model card)
+* **CATT (P1)** — DINOv3 ViT-L + DPT + cross-attention CHM fusion,
+  trained on SynRS3D + Open-Canopy stale pairs. The headline model in
+  the paper. Best val MAE = 1.9166 m at epoch 17.
+
+* **Hp7** — DINOv2 ViT-L + Depth-Anything-V2 DPT head + cross-attention
+  CHM fusion, trained on HyperSim only. The PromptDA-aligned baseline
+  used for the indoor metric-depth (ARKitScenes) prompt-corruption
+  sweep. Training is ongoing; ``last.ckpt`` is the canonical artefact
+  for now (best so far: val MAE 1.7132 m at epoch 15).
+
+Layout on the Hub::
+
+    mldatauser/model_weights/height_estimation/
+    ├── P1_v1_catt_synoc_dfcval/
+    │   ├── epoch=17-val_mae=1.9166.ckpt   ← default --variant catt
+    │   ├── epoch=15-val_mae=1.9824.ckpt
+    │   ├── epoch=18-val_mae=1.9715.ckpt
+    │   ├── last.ckpt
+    │   ├── config.yaml
+    │   └── README.md
+    └── Hp7_v1_hypersim_dav2/
+        ├── last.ckpt                      ← default --variant hp7
+        ├── config.yaml
+        └── README.md
 
 Usage
 -----
-    # default: pulls the published epoch-17 checkpoint into weights/
+    # default: pull the published epoch-17 CATT checkpoint into weights/
     python scripts/download_weights.py
 
-    # download the *latest* epoch (last.ckpt) instead
-    python scripts/download_weights.py --filename last.ckpt
+    # pull the Hp7 last checkpoint (renamed to weights/Hp7_hypersim_last.ckpt)
+    python scripts/download_weights.py --variant hp7
 
-    # download a specific other artefact in the same subfolder
-    python scripts/download_weights.py \
-        --filename epoch=18-val_mae=1.9715.ckpt
+    # pull the *latest* epoch (last.ckpt) of CATT
+    python scripts/download_weights.py --variant catt --filename last.ckpt
+
+    # pull a specific other artefact (e.g. an alternate epoch)
+    python scripts/download_weights.py \\
+        --variant catt --filename "epoch=18-val_mae=1.9715.ckpt"
 """
 
 from __future__ import annotations
@@ -39,15 +58,44 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s",
 log = logging.getLogger(__name__)
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-
-# Public mirror — the same `mldatauser` org that hosts the DINOv3
-# backbone weights pulled by code/model/dinov3_model.py.
 DEFAULT_REPO = "mldatauser/model_weights"
-HF_SUBDIR = "height_estimation/P1_v1_catt_synoc_dfcval"
-DEFAULT_FILE = "epoch=17-val_mae=1.9166.ckpt"          # benchmark checkpoint
-LAST_FILE    = "last.ckpt"                             # latest epoch
 
-DEFAULT_DEST = PACKAGE_ROOT / "weights" / "P1_catt_epoch17.ckpt"
+# Per-variant defaults. The ``alias`` is the friendly local filename
+# under ``weights/`` so reviewer-facing scripts (``run_*.sh``,
+# ``infer.py``) can use a stable name regardless of which checkpoint
+# epoch we end up publishing.
+VARIANTS: dict[str, dict] = {
+    "catt": {
+        "subdir": "height_estimation/P1_v1_catt_synoc_dfcval",
+        "default_filename": "epoch=17-val_mae=1.9166.ckpt",
+        "alias": "P1_catt_epoch17.ckpt",
+        "description": "CATT (DINOv3 + DPT + CHM cross-attn) — headline model.",
+    },
+    "hp7": {
+        "subdir": "height_estimation/Hp7_v1_hypersim_dav2",
+        # Currently published artefact. The training run is still
+        # progressing — once it converges we'll add the best
+        # epoch=*-val_mae=*.ckpt to the same subfolder; until then
+        # last.ckpt is the canonical reference for reviewers.
+        "default_filename": "last.ckpt",
+        "alias": "Hp7_hypersim_last.ckpt",
+        "description": "Hp7 (DINOv2 + DA-V2 + CHM cross-attn) — "
+                       "PromptDA-aligned indoor baseline.",
+    },
+}
+
+
+def _resolve_dest(variant: str, filename: str, dest_arg: Path | None) -> Path:
+    """Pick the on-disk filename. If reviewer asked for the variant's
+    default file, use the friendly alias; otherwise mirror the HF
+    filename verbatim under ``weights/``.
+    """
+    if dest_arg is not None:
+        return dest_arg
+    weights_dir = PACKAGE_ROOT / "weights"
+    if filename == VARIANTS[variant]["default_filename"]:
+        return weights_dir / VARIANTS[variant]["alias"]
+    return weights_dir / Path(filename).name
 
 
 def main():
@@ -55,19 +103,32 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--variant", choices=sorted(VARIANTS.keys()),
+                        default="catt",
+                        help="Which model to pull (default: %(default)s). "
+                             "Use 'hp7' for the indoor ARKitScenes benchmark.")
     parser.add_argument("--repo-id", default=DEFAULT_REPO,
                         help="HF repo id (default: %(default)s)")
-    parser.add_argument("--subdir", default=HF_SUBDIR,
-                        help="Subfolder inside the HF repo "
-                             "(default: %(default)s)")
-    parser.add_argument("--filename", default=DEFAULT_FILE,
-                        help=f"File inside {HF_SUBDIR}/ "
-                             f"(default: %(default)s — the published "
-                             f"benchmark checkpoint)")
+    parser.add_argument("--subdir", default=None,
+                        help="Override the subfolder inside the HF repo "
+                             "(default: variant-specific).")
+    parser.add_argument("--filename", default=None,
+                        help="File inside <subdir>/ "
+                             "(default: variant-specific best checkpoint)")
     parser.add_argument("--dest", type=Path, default=None,
                         help="Local destination path "
-                             f"(default: weights/<basename of --filename>)")
+                             "(default: weights/<friendly alias> or "
+                             "weights/<basename of --filename>).")
     args = parser.parse_args()
+
+    variant = VARIANTS[args.variant]
+    subdir = args.subdir or variant["subdir"]
+    filename = args.filename or variant["default_filename"]
+    dest = _resolve_dest(args.variant, filename, args.dest)
+
+    log.info("Variant:  %s — %s", args.variant, variant["description"])
+    log.info("HF path:  %s :: %s/%s", args.repo_id, subdir, filename)
+    log.info("Local:    %s", dest)
 
     try:
         from huggingface_hub import hf_hub_download
@@ -77,23 +138,20 @@ def main():
             "'pip install -r requirements.txt' first."
         )
 
-    path_in_repo = f"{args.subdir.rstrip('/')}/{args.filename}"
-    dest = args.dest or (PACKAGE_ROOT / "weights" / Path(args.filename).name)
-
     if dest.exists():
         log.info("Checkpoint already present at %s — nothing to do.", dest)
         return
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    log.info("Downloading %s::%s → %s", args.repo_id, path_in_repo, dest)
+    path_in_repo = f"{subdir.rstrip('/')}/{filename}"
 
     # hf_transfer accelerates large multipart downloads when installed
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
-    # `token` is omitted: huggingface_hub falls back to the cached credentials
-    # written by `hf auth login` (~/.cache/huggingface/token). The
-    # mldatauser/model_weights repo is public, so anonymous downloads also
-    # work for reviewers who haven't logged in.
+    # token=None: huggingface_hub falls back to the cached credentials
+    # written by `hf auth login`. The mldatauser/model_weights repo is
+    # public, so anonymous downloads also work for reviewers who haven't
+    # logged in.
     cached = hf_hub_download(
         repo_id=args.repo_id,
         filename=path_in_repo,
@@ -101,9 +159,6 @@ def main():
     )
     cached_path = Path(cached)
     if cached_path.resolve() != dest.resolve():
-        # hf_hub_download may have put the file at <local_dir>/<path_in_repo>
-        # (i.e. nested under height_estimation/...). Symlink the friendly
-        # flat name reviewers expect.
         if dest.is_symlink() or dest.exists():
             dest.unlink()
         try:

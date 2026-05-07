@@ -1,0 +1,257 @@
+# Hp7_v1_hypersim_dav2 -- depth-anything-v2-initialised baseline.
+#
+# Why a new architecture (vs Hp1..Hp6)
+# ------------------------------------
+# Hp5's gradient-flow probe showed our DPT head + decoder were stuck because:
+#   1. random head + sigmoid + min-max-normalised target → near-saturated
+#      step-0 prediction (sigmoid logit drift unbounded).
+#   2. CATT and counterfactual losses inject gradient ONLY into the CHM
+#      encoder, not through the decoder/head, so the parts that need most
+#      learning got the least signal.
+#   3. cross_attn_layer_scale_init=0.1 means cross-attn already perturbs
+#      the foundation features at step 0 — without a pretrained head to
+#      absorb that, predictions diverge or freeze.
+#
+# Hp7 mirrors PromptDA's recipe:
+#   * Foundation init: load model_weights/depth_anything_v2_vitl.pth into
+#     BOTH the DINOv2 ViT-L backbone AND the DPT head (343/343 + 64/64
+#     keys load cleanly with our Dinov2HeightModelDPT).
+#   * Backbone FROZEN (per user directive). Only the cross-attn decoder,
+#     CHM encoder, and DA-V2 head fine-tune.
+#   * Cross-attn LayerScale init = 1e-8 → step-0 cross-attn contribution
+#     is effectively zero, so the model behaves like DA-V2 at step 0.
+#     LR warm-up + learnable γ slowly opens the cross-attn path.
+#   * Final 1×1 classifier conv re-initialised with std=0.01: DA-V2 outputs
+#     raw metric depth (~0–10 m), and sigmoid(metric_depth) ≈ 1 everywhere
+#     → instant saturation. After re-init the post-sigmoid step-0 output
+#     is ≈ 0.52 (verified empirically).
+#   * Parameter-group LRs: very small 5e-6 for the DA-V2 head body
+#     (preserve depth-pretraining), 5e-5 for the freshly-init'd
+#     classifier, 5e-5 for the cross-attn decoder + CHM encoder, 0.0
+#     for the frozen backbone.
+#   * Loss = L1 + EdgeAwareSignedGradient ONLY (PromptDA-aligned).
+#     CATT, counterfactual, aux_chm_recon, per-layer probes all OFF
+#     so all gradients pass end-to-end through head ↔ decoder ↔ encoder.
+#
+# Pass / fail signals (after epoch 5):
+#   * val_mae < 1.5 m (Hp1: 3.0 m; Hp3-SM: 3.07 m; Hp5: stuck saturated).
+#   * Cross-attn LayerScale γ mean drift > 1e-7 (warm-up working).
+#   * Sigmoid output mean over val ∈ [0.2, 0.8] (no saturation).
+#   * Decoder grad norm > 1e-3 throughout.
+#   * Image panel "max height" reads 4–8 m for sensible HyperSim rooms.
+
+name: "depth-estimation-dpt-hypersim-Hp7-v1-dav2"
+mlflow_experiment: "tree-height"
+
+# --- Model ---
+model:
+  type: "dinov2_height_model"
+  name: "Dinov2HeightModelDPT"
+
+Dinov2HeightModelDPT:
+  num_classes: 1
+  backbone_type: "vitl"
+  patch_size: 14
+  load_pretrained_da_v2: true
+  da_v2_weights_path: "model_weights/depth_anything_v2_vitl.pth"
+
+  n_layers: 10
+  n_heads: 8
+  ffn_ratio: 4
+  dropout: 0.1
+  chm_dropout: 0.0
+  aux_chm_recon: false
+  cross_attn_window: 3
+
+  layer_scale_init: 1.0e-5
+  # 1e-8 ≈ 0; cross-attn delta starts negligible so step-0 output is
+  # the DA-V2 head's response. γ is learnable so warm-up grows it.
+  cross_attn_layer_scale_init: 1.0e-8
+  chm_pred_per_layer: false
+
+  # σ-reparam OFF for Hp7 baseline. DA-V2 head was trained without it,
+  # and turning it on inside the head would shift initial activations
+  # off-distribution. We can re-enable it just on cross-attn QKV in a
+  # follow-up if QK norms start climbing.
+  decoder_cross_attn_qkv_spectral_norm: false
+  decoder_self_attn_qkv_spectral_norm: false
+  sigma_reparam_learnable: false
+  sigma_reparam_apply_to_all_linears: false
+
+  dpt_features: 256
+  dpt_out_channels: [256, 512, 1024, 1024]
+  dpt_use_bn: false
+  reinit_final_classifier: true   # required when output_activation=sigmoid
+
+# --- Lightning module ---
+lightning_module:
+  class_name: "HeightEstimationModule"
+
+task_type: "regression"
+classes: 1
+channels: 3
+
+# Sigmoid bounds the head output to [0,1], matching min-max-normalised
+# targets. With reinit_final_classifier=true, step-0 sigmoid mean ≈ 0.52.
+output_activation: "sigmoid"
+
+# --- Losses (PromptDA-aligned, end-to-end gradient flow) ---
+loss: ["L1HeightLoss", "EdgeAwareSignedGradientLoss"]
+loss_weights: [1.0, 2.0]
+L1HeightLoss:
+  ignore_zero: true
+EdgeAwareSignedGradientLoss:
+  ignore_zero: true
+  erode_iters: 1
+  scales: [1, 2, 4]
+
+aux_chm_recon_weight: 0.0
+
+chm_catt:
+  enabled: false
+
+chm_per_layer_probe:
+  enabled: false
+
+chm_counterfactual:
+  enabled: false
+
+chm_health_probes:
+  enabled: true
+  log_grad_every_n_steps: 100
+  log_attn_every_n_steps: 200
+  input_sens_every_n_epochs: 1
+  attn_max_layers: 3
+  input_sens_image_size: 224
+
+# --- Train data: HyperSim only at DINOv2-aligned resolution ---
+train_data_loader:
+  class: "PerSourceBatchDataset"
+  data_dir: ""
+  length: 8000
+  streams:
+    - class: "HypersimDepthDataset"
+      data_dir: "data/tg/tree_height/benchmarking/hypersim"
+      name: "hypersim_train"
+      held_out_pct: 0.10
+      role: "train"
+      normalisation: "8bit"
+      channels: 3
+      max_depth_m: 1000.0
+      depth_convention: "distance"
+      minmax_normalise: true
+      minmax_min_scale: 0.5
+      chm_corruption:
+        cutout_prob: 0.0
+        max_shift: 75
+        resolution_factor: 1.0
+        gaussian_blur_sigma: 1.0
+        height_noise_sigma: 0.01
+        full_dropout_prob: 0.0
+        always_on_noise_sigma: 0.005
+      # No chm_contrastive_corruption — CATT is disabled, so the v1/v2 views
+      # would be wasted compute and emit a "dataset emits views but no
+      # consumer is enabled" warning each step.
+      transforms:
+        augmentations: ["crop", "spatial", "color"]
+        scaling: "imagenet_scaling"
+        image_size: 224          # DINOv2 patch=14 → 16x16 grid
+
+# --- Val data ---
+val_data_loader:
+  class: "PerSourceBatchDataset"
+  data_dir: ""
+  streams:
+    - class: "HypersimDepthDataset"
+      data_dir: "data/tg/tree_height/benchmarking/hypersim"
+      name: "hypersim_val"
+      held_out_pct: 0.10
+      role: "val"
+      normalisation: "8bit"
+      channels: 3
+      max_depth_m: 1000.0
+      depth_convention: "distance"
+      minmax_normalise: true
+      minmax_min_scale: 0.5
+      chm_corruption:
+        cutout_prob: 0.0
+        max_shift: 75
+        resolution_factor: 1.0
+        gaussian_blur_sigma: 0.0
+        height_noise_sigma: 0.01
+        full_dropout_prob: 0.0
+        always_on_noise_sigma: 0.005
+      transforms:
+        augmentations: ["crop"]
+        scaling: "imagenet_scaling"
+        image_size: 448          # 32x32 token grid; divides 14 cleanly
+
+# --- DataLoader (A6000 49GB; DA-V2 head + DPT fusion is heavier than V1) ---
+dataloader:
+  batch_size: 12
+  val_batch_size: 4
+  num_workers: 4
+  pin_memory: true
+  collate_fn: "per_source_collate"
+
+# --- Optimizer: AdamW with per-group LRs ---
+# steps_per_epoch (optimizer) = ceil(8000 / 12) / 4 = 167
+# warmup_iters=400 ≈ 2.4 epochs of optimizer steps
+# total_iters at 50 epochs ≈ 8350 steps
+optimizer: "AdamW"
+optimizer_params:
+  lr: 5.0e-5            # default fallback for any unmatched param
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  parameter_groups:
+    backbone:
+      match: ["backbone."]
+      lr: 0.0            # frozen (also requires_grad=False inside model)
+      weight_decay: 0.0
+    dav2_head_body:
+      match:
+        - "head.projects"
+        - "head.resize_layers"
+        - "head.scratch.layer"
+        - "head.scratch.refinenet"
+        - "head.scratch.output_conv1"
+      lr: 5.0e-6         # very small: preserve DA-V2 fine-tuning
+      weight_decay: 0.01
+    dav2_head_classifier:
+      match: ["head.scratch.output_conv2"]
+      lr: 5.0e-5         # higher: freshly re-init'd, needs to learn fast
+      weight_decay: 0.01
+    cross_attn_decoder:
+      match: ["decoder.", "chm_encoder."]
+      lr: 5.0e-5         # main trainable surface
+      weight_decay: 0.01
+
+# --- Schedule: warm-up then cosine decay ---
+scheduler:
+  name: "CosineAnnealingLRWithWarmup"
+  params:
+    CosineAnnealingLRWithWarmup:
+      total_iters: 8350      # ~50 epochs * 167 opt steps/epoch
+      warmup_iters: 400      # ~2.4 epochs of opt steps
+      eta_min: 1.0e-7
+
+early_stopping: true
+early_stop:
+  monitor: "val_mae"
+  mode: "min"
+  min_delta: 0.01
+  patience: 10
+  verbose: 1
+
+trainer:
+  max_epochs: 50
+  precision: "bf16-mixed"
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 4
+  devices: [0]
+
+checkpoint_dir: "checkpoints"
+log_dir: "logs"
+
+mlflow_image_logging: true
+mlflow_image_log_freq: 1

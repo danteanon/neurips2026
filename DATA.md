@@ -5,17 +5,22 @@ This file is a condensed copy of the upstream dataset README at
 recipes are reproduced verbatim so reviewers can re-fetch the data
 independently.
 
-| Dir | Source | Size | Tiles | Used in |
+| Dir | Source | Size | Tiles / frames | Used in |
 |---|---|---:|---:|---|
-| `synrs3d/SynRS3D/`      | SynRS3D synthetic (NeurIPS 2024 spotlight)                            | 206 GB | 69,667 | training |
-| `synrs3d/dfc/`          | IEEE GRSS DFC 2018 + 2019, repackaged by SynRS3D authors              | 22 GB  | 11,191 | **eval** |
-| `synrs3d/open_canopy/`  | Open-Canopy (CVPR 2025) — French SPOT 6/7 + IGN LiDAR-HD CHM          | 393 GB | n/a    | training |
-| `synrs3d/ogc/`          | OGC ATL + ARG, repackaged by SynRS3D authors                          | 66 GB  | 26,741 | training (optional) |
-| `synrs3d/geonrw/`       | GeoNRW (Aachen→Wuppertal, 42 NRW cities), repackaged by SynRS3D authors | 212 GB | 122,624 | training (optional) |
+| `synrs3d/SynRS3D/`      | SynRS3D synthetic (NeurIPS 2024 spotlight)                            | 206 GB | 69,667 | training (CATT) |
+| `synrs3d/dfc/`          | IEEE GRSS DFC 2018 + 2019, repackaged by SynRS3D authors              | 22 GB  | 11,191 | **eval (CATT, aerial)** |
+| `synrs3d/open_canopy/`  | Open-Canopy (CVPR 2025) — French SPOT 6/7 + IGN LiDAR-HD CHM          | 393 GB | n/a    | training (CATT) |
+| `synrs3d/ogc/`          | OGC ATL + ARG, repackaged by SynRS3D authors                          | 66 GB  | 26,741 | training (optional, CATT) |
+| `synrs3d/geonrw/`       | GeoNRW (Aachen→Wuppertal, 42 NRW cities), repackaged by SynRS3D authors | 212 GB | 122,624 | training (optional, CATT) |
+| `arkitscenes/upsampling/` | Apple ARKitScenes upsampling track (RGB + iPhone-LiDAR + highres-LiDAR) | ~80 GB Val / ~530 GB Train | 287 / 1,970 videos | **eval (Hp7 vs PromptDA, indoor)** |
+| `hypersim/`             | Apple HyperSim photorealistic indoor scenes                            | ~250 GB | 461 scenes | training (Hp7) |
 
-The minimum download to reproduce the headline benchmark (`bash
+The minimum download to reproduce the aerial CATT benchmark (`bash
 scripts/download_data.sh --minimal`) is just `synrs3d/dfc/` (22 GB).
-The full training set (`--full`) pulls SynRS3D + Open-Canopy + DFC.
+To reproduce the indoor Hp7 vs PromptDA benchmark instead, use `bash
+scripts/download_data.sh --arkitscenes` (~80 GB; only the Validation
+split is fetched). `--full` pulls everything plus SynRS3D + Open-Canopy
+for retraining.
 
 All commands below assume the working directory is `data/` inside
 this reviewer package.
@@ -76,6 +81,47 @@ gdown 1eTRYKdqX1Qce0Gq6EsmVQcWoiEioOdSB -O OGC_ARG.zip
 gdown 1yWOWpgcpW2JhmBGedNApuzuNspnnVngF -O GeoNRW.zip
 ```
 
+## `arkitscenes/upsampling/` — ARKitScenes depth-upsampling track
+
+The official downloader at https://github.com/apple/ARKitScenes is the
+only authoritative source (Apple S3 buckets refuse anonymous range
+requests, so do not try to `wget` directly). The Validation split (287
+videos, ~80 GB) is enough to reproduce
+`benchmarking/results/arkitscenes/results_hp7_vs_promptda_arkit_summary.md`.
+
+```bash
+git clone --depth 1 https://github.com/apple/ARKitScenes \
+    benchmarking/repos/ARKitScenes
+( cd benchmarking/repos/ARKitScenes && \
+  python3 download_data.py upsampling \
+    --video_id_csv depth_upsampling/upsampling_train_val_splits.csv \
+    --split Validation \
+    --download_dir "$PWD/../../../data/arkitscenes/upsampling" )
+```
+
+`scripts/download_data.sh --arkitscenes` wraps both steps. Pass
+`ARKIT_FULL=1` to also fetch the 1 970-video Training split (~530 GB).
+
+Each `upsampling/Validation/<video_id>/` contains three
+synchronised PNG streams used by the benchmark:
+
+| Subdir | Format | Units |
+|---|---|---|
+| `wide/` (or `color/`) | RGB PNG (192 × 256 → resized to 448 × 448) | 8-bit |
+| `lowres_depth/`       | uint16 PNG (iPhone LiDAR upsampled prompt)  | mm |
+| `highres_depth/`      | uint16 PNG (Faro Focus3D ground truth)      | mm |
+
+Both depth streams are clipped to 10 m before evaluation (matching
+PromptDA's preprocessing).
+
+## `hypersim/` — Apple HyperSim (Hp7 training)
+
+Hp7 was trained on HyperSim's RGB + ground-truth depth pairs at
+448 × 448. We use the official downloader from
+https://github.com/apple/ml-hypersim. See
+`data/tg/tree_height/synrs3d/README.md` (mirrored in our internal
+repo) for the exact list of scenes and the preprocessing recipe.
+
 ---
 
 ## Licences
@@ -87,6 +133,8 @@ gdown 1yWOWpgcpW2JhmBGedNApuzuNspnnVngF -O GeoNRW.zip
 | Open-Canopy              | CC-BY-4.0 |
 | OGC ATL / ARG            | CC-BY-4.0 (per upstream IEEE GRSS) |
 | GeoNRW                   | dl-de/by-2-0 (Land NRW open data) |
+| ARKitScenes              | CC-BY-NC-SA-4.0 (research only, Apple) |
+| HyperSim                 | CC-BY-NC-SA-3.0 (research only, Apple)  |
 
 ## Citations
 
@@ -106,5 +154,34 @@ gdown 1yWOWpgcpW2JhmBGedNApuzuNspnnVngF -O GeoNRW.zip
   author    = {Fajwel and others},
   booktitle = {CVPR},
   year      = {2025}
+}
+
+@inproceedings{baruch2021arkitscenes,
+  title     = {{ARKitScenes}: A Diverse Real-World Dataset for {3D}
+               Indoor Scene Understanding using Mobile {RGB-D} Data},
+  author    = {Baruch, Gilad and Chen, Zhuoyuan and Dehghan, Afshin
+               and Dimry, Tal and Feigin, Yuri and Fu, Peter and
+               Gebauer, Thomas and Joffe, Brandon and Kurz, Daniel
+               and Schwartz, Arik and Shulman, Elad},
+  booktitle = {NeurIPS Datasets and Benchmarks Track},
+  year      = {2021}
+}
+
+@inproceedings{roberts2021hypersim,
+  title     = {{Hypersim}: A Photorealistic Synthetic Dataset for
+               Holistic Indoor Scene Understanding},
+  author    = {Roberts, Mike and Ramapuram, Jason and Ranjan, Anurag
+               and Kumar, Atulit and Bautista, Miguel Angel and
+               Paczan, Nathan and Webb, Russ and Susskind, Joshua M.},
+  booktitle = {ICCV},
+  year      = {2021}
+}
+
+@article{lin2024promptda,
+  title   = {Prompt Depth Anything},
+  author  = {Lin, Haotong and Peng, Sida and Zhang, Jingxiao and
+             Wang, Xiaowei and Wang, Hujun and Zhou, Xiaowei},
+  journal = {arXiv preprint arXiv:2412.14015},
+  year    = {2024}
 }
 ```

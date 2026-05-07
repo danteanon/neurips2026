@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Clone the three competitor repositories used by the benchmarking
-# adapters, into ../benchmarking/repos/.
+# Clone the competitor repositories used by the benchmarking adapters,
+# into ../benchmarking/repos/.
 #
 # Idempotent: re-running pulls latest changes for repos that already
 # exist (no `git pull` is forced — we just skip them).
+#
+# Repos:
+#   - ResDepth   : aerial CHM baseline (DFC corruption sweep)
+#   - PromptDA   : indoor metric-depth baseline (ARKitScenes sweep)
+#   - Open-Canopy: aerial CHM baseline (DFC + Open-Canopy sweep)
+#   - ARKitScenes: official downloader for the upsampling Validation
+#                  split used by run_hp7_arkit_benchmark.sh
 #
 # This is the same set of clones documented in
 # benchmarking/README.md §Phase 1b.
@@ -29,6 +36,7 @@ clone_if_absent() {
 clone_if_absent https://github.com/prs-eth/ResDepth.git           ResDepth
 clone_if_absent https://github.com/DepthAnything/PromptDA.git     PromptDA
 clone_if_absent https://github.com/fajwel/Open-Canopy.git         Open-Canopy
+clone_if_absent https://github.com/apple/ARKitScenes.git          ARKitScenes
 
 # ResDepth ships its pretrained weights via the same repo. Fetch them
 # now so run_all_benchmarks.sh can find them.

@@ -2,29 +2,37 @@
 # Download the datasets used in this submission.
 #
 # Modes:
-#   --minimal  (default)  DFC18 + DFC19 only (~22 GB; reproduces eval).
-#   --full                Also pulls SynRS3D + Open-Canopy (~620 GB total;
-#                         required for retraining).
+#   --minimal  (default)  DFC18 + DFC19 only (~22 GB; reproduces the
+#                         CATT corruption sweep on aerial CHM).
+#   --arkitscenes         ARKitScenes upsampling split (~120 GB; needed
+#                         for the Hp7 vs PromptDA prompt-corruption
+#                         sweep on indoor metric depth).
+#   --full                Everything: minimal + arkitscenes + SynRS3D +
+#                         Open-Canopy (~740 GB total; required only
+#                         for retraining).
 #
-# All downloads land under ../data/synrs3d/ inside this reviewer
-# package. See ../DATA.md for licences and citations.
+# Aerial datasets land under ../data/synrs3d/, ARKitScenes lands under
+# ../data/arkitscenes/. See ../DATA.md for licences and citations.
 
 set -euo pipefail
 
 PACKAGE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$PACKAGE_ROOT/data/synrs3d"
+ARKIT_DIR="$PACKAGE_ROOT/data/arkitscenes"
 mkdir -p "$DATA_DIR"
 cd "$DATA_DIR"
 
 MODE="${1:-${MODE:---minimal}}"
 case "$MODE" in
-    --minimal|minimal) FULL=0 ;;
-    --full|full)       FULL=1 ;;
+    --minimal|minimal)         FULL=0; DO_ARKIT=0 ;;
+    --arkitscenes|arkitscenes) FULL=0; DO_ARKIT=1; SKIP_AERIAL=1 ;;
+    --full|full)               FULL=1; DO_ARKIT=1 ;;
     *)
-        echo "Usage: $0 [--minimal|--full]" >&2
+        echo "Usage: $0 [--minimal|--arkitscenes|--full]" >&2
         exit 2
         ;;
 esac
+SKIP_AERIAL="${SKIP_AERIAL:-0}"
 
 need() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -33,8 +41,12 @@ need() {
     fi
 }
 
+if [[ "$SKIP_AERIAL" == "1" ]]; then
+    echo "==> Skipping aerial-CHM datasets (mode=$MODE)."
+else
+
 # -------------------------------------------------------------------------
-# DFC18 + DFC19 (always)  — Google Drive zips, gdown
+# DFC18 + DFC19 (always for --minimal/--full)  — Google Drive zips, gdown
 # -------------------------------------------------------------------------
 need gdown
 mkdir -p dfc
@@ -71,10 +83,55 @@ fi
 
 cd "$DATA_DIR"
 
+fi  # SKIP_AERIAL guard
+
+# -------------------------------------------------------------------------
+# ARKitScenes (upsampling split) — pulled by the official downloader
+# from https://github.com/apple/ARKitScenes
+# -------------------------------------------------------------------------
+if [[ "$DO_ARKIT" == "1" ]]; then
+    echo ""
+    echo "==> ARKitScenes upsampling split (~120 GB across train + val)"
+    REPOS_DIR="$PACKAGE_ROOT/benchmarking/repos"
+    ARKIT_REPO="$REPOS_DIR/ARKitScenes"
+    if [[ ! -d "$ARKIT_REPO" ]]; then
+        mkdir -p "$REPOS_DIR"
+        echo "    cloning ARKitScenes downloader → $ARKIT_REPO"
+        git clone --depth 1 https://github.com/apple/ARKitScenes "$ARKIT_REPO"
+    fi
+    CSV_FILE="$ARKIT_REPO/depth_upsampling/upsampling_train_val_splits.csv"
+    if [[ ! -f "$CSV_FILE" ]]; then
+        echo "ERROR: $CSV_FILE missing — clone of ARKitScenes is incomplete." >&2
+        exit 1
+    fi
+    mkdir -p "$ARKIT_DIR"
+
+    # Validation only is sufficient for the Hp7 vs PromptDA benchmark.
+    # Pass ARKIT_FULL=1 to also pull the 1970-video Training split (only
+    # needed if you want to retrain or evaluate on Train).
+    SPLITS=("Validation")
+    if [[ "${ARKIT_FULL:-0}" == "1" ]]; then
+        SPLITS=("Training" "Validation")
+    fi
+    for split in "${SPLITS[@]}"; do
+        echo "    [→] downloading $split split"
+        ( cd "$ARKIT_REPO" && \
+          python3 download_data.py upsampling \
+              --video_id_csv "$CSV_FILE" \
+              --split "$split" \
+              --download_dir "$ARKIT_DIR/upsampling" )
+    done
+fi
+
 if [[ "$FULL" == "0" ]]; then
     echo ""
-    echo "==> Minimal data download complete. ($DATA_DIR/dfc/)"
-    echo "    Run with --full to also pull SynRS3D + Open-Canopy."
+    if [[ "$DO_ARKIT" == "1" ]]; then
+        echo "==> Download complete. (ARKitScenes only)"
+    else
+        echo "==> Minimal data download complete. ($DATA_DIR/dfc/)"
+        echo "    Run with --arkitscenes for the indoor metric-depth eval,"
+        echo "    or --full to also pull SynRS3D + Open-Canopy."
+    fi
     exit 0
 fi
 
